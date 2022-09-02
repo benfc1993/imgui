@@ -6,12 +6,16 @@ imgui.ini
 
 ## General build artifacts
 *.o
+*.d
 *.obj
 *.exe
 examples/build/*
 examples/*/Debug/*
 examples/*/Release/*
 examples/*/x64/*
+Makefile
+bin/
+bin-int/
 
 ## Visual Studio artifacts
 .vs

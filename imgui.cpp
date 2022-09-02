@@ -15416,12 +15416,192 @@ ImGuiDockNode::~ImGuiDockNode()
     ChildNodes[0] = ChildNodes[1] = NULL;
 }
 
-if (!move_tab_bar && src_node->TabBar)
+int ImGui::DockNodeGetTabOrder(ImGuiWindow *window)
 {
-    if (dst_node->TabBar)
-        dst_node->TabBar->SelectedTabId = src_node->TabBar->SelectedTabId;
-    DockNodeRemoveTabBar(src_node);
+    ImGuiTabBar *tab_bar = window->DockNode->TabBar;
+    if (tab_bar == NULL)
+        return -1;
+    ImGuiTabItem *tab = TabBarFindTabByID(tab_bar, window->TabId);
+    return tab ? tab_bar->GetTabOrder(tab) : -1;
 }
+
+static void DockNodeHideWindowDuringHostWindowCreation(ImGuiWindow *window)
+{
+    window->Hidden = true;
+    window->HiddenFramesCanSkipItems = window->Active ? 1 : 2;
+}
+
+static void ImGui::DockNodeAddWindow(ImGuiDockNode *node, ImGuiWindow *window, bool add_to_tab_bar)
+{
+    ImGuiContext &g = *GImGui;
+    (void)g;
+    if (window->DockNode)
+    {
+        // Can overwrite an existing window->DockNode (e.g. pointing to a disabled DockSpace node)
+        IM_ASSERT(window->DockNode->ID != node->ID);
+        DockNodeRemoveWindow(window->DockNode, window, 0);
+    }
+    IM_ASSERT(window->DockNode == NULL || window->DockNodeAsHost == NULL);
+    IMGUI_DEBUG_LOG_DOCKING("[docking] DockNodeAddWindow node 0x%08X window '%s'\n", node->ID, window->Name);
+
+    // If more than 2 windows appeared on the same frame leading to the creation of a new hosting window,
+    // we'll hide windows until the host window is ready. Hide the 1st window after its been output (so it is not visible for one frame).
+    // We will call DockNodeHideWindowDuringHostWindowCreation() on ourselves in Begin()
+    if (node->HostWindow == NULL && node->Windows.Size == 1 && node->Windows[0]->WasActive == false)
+        DockNodeHideWindowDuringHostWindowCreation(node->Windows[0]);
+
+    node->Windows.push_back(window);
+    node->WantHiddenTabBarUpdate = true;
+    window->DockNode = node;
+    window->DockId = node->ID;
+    window->DockIsActive = (node->Windows.Size > 1);
+    window->DockTabWantClose = false;
+
+    // When reactivating a node with one or two loose window, the window pos/size/viewport are authoritative over the node storage.
+    // In particular it is important we init the viewport from the first window so we don't create two viewports and drop one.
+    if (node->HostWindow == NULL && node->IsFloatingNode())
+    {
+        if (node->AuthorityForPos == ImGuiDataAuthority_Auto)
+            node->AuthorityForPos = ImGuiDataAuthority_Window;
+        if (node->AuthorityForSize == ImGuiDataAuthority_Auto)
+            node->AuthorityForSize = ImGuiDataAuthority_Window;
+        if (node->AuthorityForViewport == ImGuiDataAuthority_Auto)
+            node->AuthorityForViewport = ImGuiDataAuthority_Window;
+    }
+
+    // Add to tab bar if requested
+    if (add_to_tab_bar)
+    {
+        if (node->TabBar == NULL)
+        {
+            DockNodeAddTabBar(node);
+            node->TabBar->SelectedTabId = node->TabBar->NextSelectedTabId = node->SelectedTabId;
+
+            // Add existing windows
+            for (int n = 0; n < node->Windows.Size - 1; n++)
+                TabBarAddTab(node->TabBar, ImGuiTabItemFlags_None, node->Windows[n]);
+        }
+        TabBarAddTab(node->TabBar, ImGuiTabItemFlags_Unsorted, window);
+    }
+
+    DockNodeUpdateVisibleFlag(node);
+
+    // Update this without waiting for the next time we Begin() in the window, so our host window will have the proper title bar color on its first frame.
+    if (node->HostWindow)
+        UpdateWindowParentAndRootLinks(window, window->Flags | ImGuiWindowFlags_ChildWindow, node->HostWindow);
+}
+
+static void ImGui::DockNodeRemoveWindow(ImGuiDockNode *node, ImGuiWindow *window, ImGuiID save_dock_id)
+{
+    ImGuiContext &g = *GImGui;
+    IM_ASSERT(window->DockNode == node);
+    // IM_ASSERT(window->RootWindowDockTree == node->HostWindow);
+    // IM_ASSERT(window->LastFrameActive < g.FrameCount);    // We may call this from Begin()
+    IM_ASSERT(save_dock_id == 0 || save_dock_id == node->ID);
+    IMGUI_DEBUG_LOG_DOCKING("[docking] DockNodeRemoveWindow node 0x%08X window '%s'\n", node->ID, window->Name);
+
+    window->DockNode = NULL;
+    window->DockIsActive = window->DockTabWantClose = false;
+    window->DockId = save_dock_id;
+    window->Flags &= ~ImGuiWindowFlags_ChildWindow;
+    if (window->ParentWindow)
+        window->ParentWindow->DC.ChildWindows.find_erase(window);
+    UpdateWindowParentAndRootLinks(window, window->Flags, NULL); // Update immediately
+
+    // Remove window
+    bool erased = false;
+    for (int n = 0; n < node->Windows.Size; n++)
+        if (node->Windows[n] == window)
+        {
+            node->Windows.erase(node->Windows.Data + n);
+            erased = true;
+            break;
+        }
+    if (!erased)
+        IM_ASSERT(erased);
+    if (node->VisibleWindow == window)
+        node->VisibleWindow = NULL;
+
+    // Remove tab and possibly tab bar
+    node->WantHiddenTabBarUpdate = true;
+    if (node->TabBar)
+    {
+        TabBarRemoveTab(node->TabBar, window->TabId);
+        const int tab_count_threshold_for_tab_bar = node->IsCentralNode() ? 1 : 2;
+        if (node->Windows.Size < tab_count_threshold_for_tab_bar)
+            DockNodeRemoveTabBar(node);
+    }
+
+    if (node->Windows.Size == 0 && !node->IsCentralNode() && !node->IsDockSpace() && window->DockId != node->ID)
+    {
+        // Automatic dock node delete themselves if they are not holding at least one tab
+        DockContextRemoveNode(&g, node, true);
+        return;
+    }
+
+    if (node->Windows.Size == 1 && !node->IsCentralNode() && node->HostWindow)
+    {
+        ImGuiWindow *remaining_window = node->Windows[0];
+        if (node->HostWindow->ViewportOwned && node->IsRootNode())
+        {
+            // Transfer viewport back to the remaining loose window
+            IMGUI_DEBUG_LOG_VIEWPORT("[viewport] Node %08X transfer Viewport %08X=>%08X for Window '%s'\n", node->ID, node->HostWindow->Viewport->ID, remaining_window->ID, remaining_window->Name);
+            IM_ASSERT(node->HostWindow->Viewport->Window == node->HostWindow);
+            node->HostWindow->Viewport->Window = remaining_window;
+            node->HostWindow->Viewport->ID = remaining_window->ID;
+        }
+        remaining_window->Collapsed = node->HostWindow->Collapsed;
+    }
+
+    // Update visibility immediately is required so the DockNodeUpdateRemoveInactiveChilds() processing can reflect changes up the tree
+    DockNodeUpdateVisibleFlag(node);
+}
+
+static void ImGui::DockNodeMoveChildNodes(ImGuiDockNode *dst_node, ImGuiDockNode *src_node)
+{
+    IM_ASSERT(dst_node->Windows.Size == 0);
+    dst_node->ChildNodes[0] = src_node->ChildNodes[0];
+    dst_node->ChildNodes[1] = src_node->ChildNodes[1];
+    if (dst_node->ChildNodes[0])
+        dst_node->ChildNodes[0]->ParentNode = dst_node;
+    if (dst_node->ChildNodes[1])
+        dst_node->ChildNodes[1]->ParentNode = dst_node;
+    dst_node->SplitAxis = src_node->SplitAxis;
+    dst_node->SizeRef = src_node->SizeRef;
+    src_node->ChildNodes[0] = src_node->ChildNodes[1] = NULL;
+}
+
+static void ImGui::DockNodeMoveWindows(ImGuiDockNode *dst_node, ImGuiDockNode *src_node)
+{
+    // Insert tabs in the same orders as currently ordered (node->Windows isn't ordered)
+    IM_ASSERT(src_node && dst_node && dst_node != src_node);
+    ImGuiTabBar *src_tab_bar = src_node->TabBar;
+    if (src_tab_bar != NULL)
+        IM_ASSERT(src_node->Windows.Size <= src_node->TabBar->Tabs.Size);
+
+    // If the dst_node is empty we can just move the entire tab bar (to preserve selection, scrolling, etc.)
+    bool move_tab_bar = (src_tab_bar != NULL) && (dst_node->TabBar == NULL);
+    if (move_tab_bar)
+    {
+        dst_node->TabBar = src_node->TabBar;
+        src_node->TabBar = NULL;
+    }
+
+    // Tab order is not important here, it is preserved by sorting in DockNodeUpdateTabBar().
+    for (ImGuiWindow *window : src_node->Windows)
+    {
+        window->DockNode = NULL;
+        window->DockIsActive = false;
+        DockNodeAddWindow(dst_node, window, !move_tab_bar);
+    }
+    src_node->Windows.clear();
+
+    if (!move_tab_bar && src_node->TabBar)
+    {
+        if (dst_node->TabBar)
+            dst_node->TabBar->SelectedTabId = src_node->TabBar->SelectedTabId;
+        DockNodeRemoveTabBar(src_node);
+    }
 }
 
 static void ImGui::DockNodeApplyPosSizeToWindows(ImGuiDockNode *node)
@@ -18292,29 +18472,6 @@ static void ImGui::DockSettingsHandler_WriteAll(ImGuiContext *ctx, ImGuiSettings
         buf->appendf("\n");
     }
     buf->appendf("\n");
-}
-
-#if IMGUI_DEBUG_INI_SETTINGS
-// [DEBUG] Include comments in the .ini file to ease debugging
-if (ImGuiDockNode *node = DockContextFindNodeByID(ctx, node_settings->ID))
-{
-    buf->appendf("%*s", ImMax(2, (line_start_pos + 92) - buf->size()), ""); // Align everything
-    if (node->IsDockSpace() && node->HostWindow && node->HostWindow->ParentWindow)
-        buf->appendf(" ; in '%s'", node->HostWindow->ParentWindow->Name);
-    // Iterate settings so we can give info about windows that didn't exist during the session.
-    int contains_window = 0;
-    for (ImGuiWindowSettings *settings = g.SettingsWindows.begin(); settings != NULL; settings = g.SettingsWindows.next_chunk(settings))
-        if (settings->DockId == node_settings->ID)
-        {
-            if (contains_window++ == 0)
-                buf->appendf(" ; contains ");
-            buf->appendf("'%s' ", settings->GetName());
-        }
-}
-#endif
-buf->appendf("\n");
-}
-buf->appendf("\n");
 }
 
 //-----------------------------------------------------------------------------
