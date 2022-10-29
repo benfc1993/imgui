@@ -13,9 +13,10 @@ examples/build/*
 examples/*/Debug/*
 examples/*/Release/*
 examples/*/x64/*
-Makefile
 bin/
 bin-int/
+Makefile
+.vscode
 
 ## Visual Studio artifacts
 .vs
